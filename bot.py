@@ -1,5 +1,6 @@
 import uuid
 import random
+import asyncio
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -685,7 +686,8 @@ async def handle_tod_inl_join(update, context, temp_id):
     q = update.callback_query
     user = q.from_user
     game_id = str(uuid.uuid4())
-    game = new_tod_game(q.message.chat_id, "group")
+    # بازی از طریق inline query شروع شده -> chat_id نداریم، فقط inline_message_id داریم
+    game = new_tod_game(None, "group", inline_message_id=q.inline_message_id)
     game["players"][user.id] = user.first_name
     tod_games[game_id] = game
     await q.answer("✅ وارد بازی شدی!")
@@ -709,10 +711,6 @@ def main():
     app.add_handler(CallbackQueryHandler(button_callback))
     print("✅ ربات با موفقیت اجرا شد — بریم له کنیم! 😈")
     app.run_polling()
-
-if __name__ == "__main__":
-    main()
-
 
 # ═══════════════════════════════════════════════
 # 🎮 جرئت و حقیقت
@@ -1090,9 +1088,10 @@ TOD_DARE = [
 # وضعیت بازی‌های جرئت و حقیقت
 tod_games = {}
 
-def new_tod_game(chat_id, mode):
+def new_tod_game(chat_id, mode, inline_message_id=None):
     return {
         "chat_id": chat_id,
+        "inline_message_id": inline_message_id,  # فقط وقتی بازی از طریق inline query شروع بشه پر می‌شه
         "mode": mode,           # "group" یا "private"
         "players": {},          # {user_id: name}
         "status": "joining",    # joining / voting / playing / finished
@@ -1109,6 +1108,31 @@ def new_tod_game(chat_id, mode):
         "timer_task": None,
         "msg_id": None,
     }
+
+async def tod_deliver(context, game, text, reply_markup=None):
+    """
+    پیام رو تحویل میده:
+    - اگه بازی از طریق inline query شروع شده باشه (inline_message_id داره)،
+      همون یک پیام inline رو ادیت می‌کنه (چون chat_id نداریم و نمی‌تونیم پیام جدید بفرستیم).
+    - در غیر این صورت (بازی گروهی/خصوصی معمولی)، یه پیام جدید به chat_id می‌فرسته.
+    """
+    if game.get("inline_message_id"):
+        try:
+            await context.bot.edit_message_text(
+                inline_message_id=game["inline_message_id"],
+                text=text,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            print(f"TOD inline deliver error: {e}")
+    else:
+        try:
+            msg = await context.bot.send_message(
+                chat_id=game["chat_id"], text=text, reply_markup=reply_markup
+            )
+            game["msg_id"] = msg.message_id
+        except Exception as e:
+            print(f"TOD deliver error: {e}")
 
 def tod_random_question(game, qtype):
     if qtype == "truth":
@@ -1217,15 +1241,8 @@ async def tod_send_vote(context, game, game_id):
             f"❓ پرسشگر: {asker_name}\n\n"
             f"⬇️ {answerer_name} انتخاب کن!"
         )
-    try:
-        msg = await context.bot.send_message(
-            chat_id=game["chat_id"],
-            text=text,
-            reply_markup=build_vote_keyboard(game_id)
-        )
-        game["msg_id"] = msg.message_id
-    except Exception as e:
-        print(f"TOD vote send error: {e}")
+
+    await tod_deliver(context, game, text, build_vote_keyboard(game_id))
 
 async def tod_send_question(context, game, game_id, qtype):
     game["status"] = "playing"
@@ -1266,13 +1283,7 @@ async def tod_send_question(context, game, game_id, qtype):
             )
             kb = build_done_keyboard(game_id, qtype)
 
-    try:
-        msg = await context.bot.send_message(
-            chat_id=game["chat_id"], text=text, reply_markup=kb
-        )
-        game["msg_id"] = msg.message_id
-    except Exception as e:
-        print(f"TOD question send error: {e}")
+    await tod_deliver(context, game, text, kb)
 
     # تایمر ۳ دقیقه
     if game["timer_task"]:
@@ -1284,24 +1295,14 @@ async def tod_timer(context, game, game_id):
         await asyncio.sleep(180)  # ۳ دقیقه
         if game.get("status") == "playing" and tod_games.get(game_id) is game:
             answerer_name = game["players"].get(game["answerer"], "؟")
-            try:
-                await context.bot.send_message(
-                    chat_id=game["chat_id"],
-                    text=f"⏰ زمان {answerer_name} تموم شد! رفتیم دور بعد 😂"
-                )
-            except: pass
+            await tod_deliver(context, game, f"⏰ زمان {answerer_name} تموم شد! رفتیم دور بعد 😂")
             await tod_next_round(context, game, game_id)
     except asyncio.CancelledError:
         pass
 
 async def tod_next_round(context, game, game_id):
     if len(game["players"]) < 2:
-        try:
-            await context.bot.send_message(
-                chat_id=game["chat_id"],
-                text="😢 بازیکنان کافی نیستن. بازی تموم شد!"
-            )
-        except: pass
+        await tod_deliver(context, game, "😢 بازیکنان کافی نیستن. بازی تموم شد!")
         tod_games.pop(game_id, None)
         return
     game["answerer"], game["asker"] = tod_pick_answerer(game)
@@ -1506,22 +1507,15 @@ async def handle_tod_leave(update, context, game_id):
     q = update.callback_query
     user = q.from_user
     game = tod_games.get(game_id)
-    if not game: await q.answer("بازی پیدا نشد!"); return
+    if not game: await q.answer("بازی پیدا نشد!", show_alert=True); return
     if user.id not in game["players"]: await q.answer("تو تو این بازی نیستی!", show_alert=True); return
     del game["players"][user.id]
     await q.answer(f"🚪 {user.first_name} از بازی خارج شد")
-    try:
-        await context.bot.send_message(
-            chat_id=game["chat_id"],
-            text=f"🚪 {user.first_name} از بازی خارج شد.\n👥 {len(game['players'])} نفر باقی مونده"
-        )
-    except: pass
+    await tod_deliver(context, game, f"🚪 {user.first_name} از بازی خارج شد.\n👥 {len(game['players'])} نفر باقی مونده")
     if len(game["players"]) < 2:
         if game.get("timer_task"): game["timer_task"].cancel()
-        try:
-            await context.bot.send_message(
-                chat_id=game["chat_id"],
-                text="😢 بازیکنان کافی نیستن. بازی تموم شد!"
-            )
-        except: pass
+        await tod_deliver(context, game, "😢 بازیکنان کافی نیستن. بازی تموم شد!")
         tod_games.pop(game_id, None)
+
+if __name__ == "__main__":
+    main()
